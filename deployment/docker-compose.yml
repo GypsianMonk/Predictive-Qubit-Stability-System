@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  pqss-api:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - PQSS_ENV=production
+      - LOG_LEVEL=info
+    volumes:
+      - ../data:/app/data
+      - ../models:/app/models
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+
+  pqss-dashboard:
+    image: pqss-dashboard:latest
+    build:
+      context: ..
+      dockerfile: dashboard/Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      - PQSS_API_URL=http://pqss-api:8000
+    depends_on:
+      - pqss-api
+    restart: unless-stopped
+
+  # Optional: Redis for caching predictions
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:

@@ -1,0 +1,78 @@
+[
+  {
+    "name": "QFT_4qubit",
+    "category": "algorithm",
+    "circuit_depth": 7,
+    "qubit_count": 4,
+    "baseline": {
+      "fidelity": 0.993020965034979,
+      "execution_time": 1.503434181213379
+    },
+    "pqss": {
+      "fidelity": 0.993020965034979,
+      "execution_time": 1.9384751319885254,
+      "optimized_depth": 7
+    },
+    "improvements": {
+      "fidelity_gain_percent": 0.0,
+      "depth_reduction": 0
+    }
+  },
+  {
+    "name": "VQE_4qubit_3layer",
+    "category": "optimization",
+    "circuit_depth": 11,
+    "qubit_count": 4,
+    "baseline": {
+      "fidelity": 0.9890548353295384,
+      "execution_time": 2.5598137378692627
+    },
+    "pqss": {
+      "fidelity": 0.9890548353295384,
+      "execution_time": 3.5621869564056396,
+      "optimized_depth": 11
+    },
+    "improvements": {
+      "fidelity_gain_percent": 0.0,
+      "depth_reduction": 0
+    }
+  },
+  {
+    "name": "SurfaceCode_fragment",
+    "category": "error_correction",
+    "circuit_depth": 5,
+    "qubit_count": 5,
+    "baseline": {
+      "fidelity": 0.995009990004999,
+      "execution_time": 0.9305157661437988
+    },
+    "pqss": {
+      "fidelity": 0.995009990004999,
+      "execution_time": 0.9275991916656494,
+      "optimized_depth": 5
+    },
+    "improvements": {
+      "fidelity_gain_percent": 0.0,
+      "depth_reduction": 0
+    }
+  },
+  {
+    "name": "Random_6qubit_depth15",
+    "category": "random",
+    "circuit_depth": 31,
+    "qubit_count": 6,
+    "baseline": {
+      "fidelity": 0.9694605362958226,
+      "execution_time": 8.56447720527649
+    },
+    "pqss": {
+      "fidelity": 0.9694605362958226,
+      "execution_time": 17.859350204467773,
+      "optimized_depth": 31
+    },
+    "improvements": {
+      "fidelity_gain_percent": 0.0,
+      "depth_reduction": 0
+    }
+  }
+]
