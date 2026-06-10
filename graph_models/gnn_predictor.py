@@ -1,311 +1,512 @@
 """
 Graph Neural Networks for Quantum Error Propagation Modeling
-Models qubit connectivity and error spread in quantum systems
+Implements GNN architectures for entanglement stability and error spread prediction
 """
 
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 import warnings
 
+# Check if CUDA is available
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 
 @dataclass
-class GraphConfig:
+class GNNConfig:
     """Configuration for GNN models"""
-    num_nodes: int = 5
-    node_features: int = 17
-    hidden_dim: int = 64
+    # Graph properties
+    num_nodes: int = 10  # Number of qubits
+    node_features: int = 8  # Features per qubit
+    edge_features: int = 3  # Features per connection
+    
+    # GNN architecture
+    hidden_channels: int = 64
     num_layers: int = 3
     dropout: float = 0.3
+    aggregation: str = 'mean'  # 'mean', 'sum', 'max'
+    
+    # Training parameters
     learning_rate: float = 0.001
+    batch_size: int = 32
+    num_epochs: int = 50
+    weight_decay: float = 1e-5
 
 
-class QuantumGraph:
-    """Represents the quantum system as a graph"""
+class GraphConvolution(nn.Module):
+    """Simple graph convolutional layer"""
     
-    def __init__(self, num_qubits: int, connectivity: Optional[np.ndarray] = None):
-        self.num_nodes = num_qubits
-        self.node_features = np.zeros((num_qubits, 17))  # 17 telemetry features
+    def __init__(self, in_features: int, out_features: int, dropout: float = 0.0, bias: bool = True):
+        super(GraphConvolution, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+        self.reset_parameters()
         
-        # Default: nearest neighbor connectivity
-        if connectivity is None:
-            self.adjacency_matrix = self._create_nearest_neighbor_graph(num_qubits)
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.linear.weight)
+        if self.linear.bias is not None:
+            nn.init.zeros_(self.linear.bias)
+            
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        support = self.linear(x)
+        output = torch.matmul(adj, support)
+        return self.dropout(output)
+
+
+class GraphAttentionLayer(nn.Module):
+    """Graph Attention Network (GAT) layer"""
+    
+    def __init__(self, in_features: int, out_features: int, num_heads: int = 4,
+                 dropout: float = 0.0, alpha: float = 0.2, concat: bool = True):
+        super(GraphAttentionLayer, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_heads = num_heads
+        self.concat = concat
+        
+        self.W = nn.Parameter(torch.empty(num_heads, in_features, out_features))
+        self.a = nn.Parameter(torch.empty(num_heads, 2 * out_features, 1))
+        self.leakyrelu = nn.LeakyReLU(alpha)
+        self.dropout = nn.Dropout(dropout)
+        self.reset_parameters()
+        
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.W)
+        nn.init.xavier_uniform_(self.a)
+        
+    def forward(self, x: torch.Tensor, adj: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        batch_size, num_nodes, in_features = x.shape
+        h = torch.matmul(x.unsqueeze(1), self.W)  # (batch, heads, nodes, out_features)
+        
+        # Use actual num_nodes from input
+        h_i = h.unsqueeze(2).expand(-1, -1, num_nodes, -1, -1)
+        h_j = h.unsqueeze(1).expand(-1, -1, num_nodes, -1, -1)
+        
+        a_input = torch.cat([h_i, h_j], dim=-1)
+        e = torch.matmul(a_input, self.a.unsqueeze(0)).squeeze(-1)
+        e = self.leakyrelu(e)
+        
+        if mask is not None:
+            e = e.masked_fill(mask == 0, -1e9)
         else:
-            self.adjacency_matrix = connectivity
+            # Ensure adj has correct shape
+            if adj.shape[-1] != num_nodes or adj.shape[-2] != num_nodes:
+                adj_trimmed = adj[:, :num_nodes, :num_nodes]
+            else:
+                adj_trimmed = adj
+            e = e.masked_fill(adj_trimmed.unsqueeze(1) == 0, -1e9)
+            
+        attention = F.softmax(e, dim=-1)
+        attention = self.dropout(attention)
+        h_prime = torch.matmul(attention, h)
         
-        self.edge_index = self._adjacency_to_edge_index(self.adjacency_matrix)
-    
-    def _create_nearest_neighbor_graph(self, n: int) -> np.ndarray:
-        """Create nearest neighbor connectivity matrix"""
-        adj = np.zeros((n, n))
-        for i in range(n):
-            if i > 0:
-                adj[i, i-1] = 1
-                adj[i-1, i] = 1
-            if i < n - 1:
-                adj[i, i+1] = 1
-                adj[i+1, i] = 1
-        return adj
-    
-    def _adjacency_to_edge_index(self, adj: np.ndarray) -> np.ndarray:
-        """Convert adjacency matrix to edge index format"""
-        edges = []
-        for i in range(adj.shape[0]):
-            for j in range(adj.shape[1]):
-                if adj[i, j] > 0:
-                    edges.append([i, j])
-        return np.array(edges).T if edges else np.array([]).reshape(2, 0)
-    
-    def update_node_features(self, qubit_id: int, features: np.ndarray):
-        """Update features for a specific qubit"""
-        if 0 <= qubit_id < self.num_nodes:
-            self.node_features[qubit_id] = features
-    
-    def get_error_propagation_probability(self, source_qubit: int) -> np.ndarray:
-        """Calculate probability of error spreading from source to other qubits"""
-        probs = np.zeros(self.num_nodes)
-        probs[source_qubit] = 1.0
-        
-        # Simple diffusion model
-        for _ in range(3):  # 3 propagation steps
-            new_probs = probs.copy()
-            for i in range(self.num_nodes):
-                neighbors = np.where(self.adjacency_matrix[i] > 0)[0]
-                if len(neighbors) > 0:
-                    new_probs[i] += 0.3 * np.mean(probs[neighbors])
-            probs = new_probs / np.max(new_probs)
-        
-        return probs
-
-
-class GraphConvolutionalLayer:
-    """Simple Graph Convolutional Network layer (fallback implementation)"""
-    
-    def __init__(self, in_features: int, out_features: int, dropout: float = 0.3):
-        self.weights = np.random.randn(in_features, out_features) * 0.1
-        self.bias = np.zeros(out_features)
-        self.dropout_rate = dropout
-    
-    def forward(self, features: np.ndarray, edge_index: np.ndarray, 
-                num_nodes: int) -> np.ndarray:
-        """Forward pass through GCN layer"""
-        # Normalize adjacency
-        adj_norm = self._normalize_adjacency(edge_index, num_nodes)
-        
-        # Message passing: aggregate neighbor features
-        aggregated = adj_norm @ features
-        
-        # Linear transformation
-        output = aggregated @ self.weights + self.bias
-        
-        # ReLU activation
-        output = np.maximum(0, output)
-        
-        # Dropout
-        if self.dropout_rate > 0:
-            mask = np.random.binomial(1, 1 - self.dropout_rate, output.shape)
-            output = output * mask / (1 - self.dropout_rate)
-        
+        if self.concat:
+            output = h_prime.reshape(batch_size, num_nodes, -1)
+        else:
+            output = h_prime.mean(dim=1)
+            
         return output
-    
-    def _normalize_adjacency(self, edge_index: np.ndarray, num_nodes: int) -> np.ndarray:
-        """Compute normalized adjacency matrix with self-loops"""
-        adj = np.zeros((num_nodes, num_nodes))
-        
-        # Add self-loops
-        for i in range(num_nodes):
-            adj[i, i] = 1
-        
-        # Add edges
-        if edge_index.size > 0:
-            for i in range(edge_index.shape[1]):
-                src, dst = edge_index[0, i], edge_index[1, i]
-                adj[src, dst] = 1
-        
-        # Row-normalize
-        row_sum = adj.sum(axis=1, keepdims=True)
-        row_sum[row_sum == 0] = 1  # Avoid division by zero
-        adj_norm = adj / row_sum
-        
-        return adj_norm
 
 
-class QuantumGNN:
-    """Graph Neural Network for quantum error prediction"""
+class QuantumGNN(nn.Module):
+    """Graph Neural Network for quantum error propagation modeling"""
     
-    def __init__(self, config: GraphConfig):
+    def __init__(self, config: GNNConfig):
+        super(QuantumGNN, self).__init__()
         self.config = config
-        self.layers = []
         
-        # Build GNN layers
-        in_dim = config.node_features
+        self.node_embedding = nn.Linear(config.node_features, config.hidden_channels)
+        
+        if config.edge_features > 0:
+            self.edge_embedding = nn.Linear(config.edge_features, config.hidden_channels)
+        else:
+            self.edge_embedding = None
+            
+        self.conv_layers = nn.ModuleList()
+        in_channels = config.hidden_channels
+        
         for i in range(config.num_layers):
-            out_dim = config.hidden_dim if i < config.num_layers - 1 else 1
-            self.layers.append(GraphConvolutionalLayer(
-                in_dim, out_dim, config.dropout
-            ))
-            in_dim = config.hidden_dim
-    
-    def predict_error_probability(self, graph: QuantumGraph) -> np.ndarray:
-        """Predict error probability for each qubit"""
-        features = graph.node_features
-        edge_index = graph.edge_index
+            out_channels = config.hidden_channels // (2 ** i) if i < config.num_layers - 1 else config.hidden_channels
+            conv = GraphConvolution(in_features=in_channels, out_features=out_channels, dropout=config.dropout)
+            self.conv_layers.append(conv)
+            in_channels = out_channels
+            
+        self.batch_norms = nn.ModuleList([
+            nn.BatchNorm1d(config.hidden_channels // (2 ** i) if i < config.num_layers - 1 else config.hidden_channels)
+            for i in range(config.num_layers)
+        ])
         
-        # Forward pass through all layers
-        for layer in self.layers[:-1]:
-            features = layer.forward(features, edge_index, graph.num_nodes)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
         
-        # Final layer for binary classification
-        final_layer = self.layers[-1]
-        probabilities = final_layer.forward(features, edge_index, graph.num_nodes)
+        self.node_classifier = nn.Sequential(
+            nn.Linear(in_channels, in_channels * 2),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(in_channels * 2, 1),
+            nn.Sigmoid()
+        )
         
-        # Sigmoid activation for probability
-        probabilities = 1 / (1 + np.exp(-probabilities))
+        self.graph_classifier = nn.Sequential(
+            nn.Linear(in_channels, in_channels * 2),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(in_channels * 2, 1),
+            nn.Sigmoid()
+        )
         
-        return probabilities.flatten()
-    
-    def predict_error_propagation(self, graph: QuantumGraph, 
-                                  source_qubit: int) -> Dict:
-        """Predict how errors propagate from a source qubit"""
-        base_probs = self.predict_error_probability(graph)
-        propagation_probs = graph.get_error_propagation_probability(source_qubit)
+        self.edge_predictor = nn.Sequential(
+            nn.Linear(in_channels * 2, in_channels),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(in_channels, 1),
+            nn.Sigmoid()
+        )
         
-        # Combine base error probability with propagation
-        combined_probs = 0.7 * base_probs + 0.3 * propagation_probs * base_probs[source_qubit]
+    def forward(self, x: torch.Tensor, adj: torch.Tensor, edge_features: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        batch_size, num_nodes, _ = x.shape
+        h = F.relu(self.node_embedding(x))
+        
+        if edge_features is not None and self.edge_embedding is not None:
+            edge_emb = self.edge_embedding(edge_features)
+            adj_weighted = adj * edge_emb.mean(dim=-1, keepdim=True)
+        else:
+            adj_weighted = adj
+            
+        for i, (conv, bn) in enumerate(zip(self.conv_layers, self.batch_norms)):
+            h_prev = h
+            h = conv(h, adj_weighted)
+            
+            if i > 0 and h.shape == h_prev.shape:
+                h = h + h_prev
+                
+            h = h.transpose(1, 2)
+            h = bn(h)
+            h = h.transpose(1, 2)
+            h = F.relu(h)
+            
+        node_preds = self.node_classifier(h)
+        h_graph = h.transpose(1, 2)
+        h_graph = self.global_pool(h_graph).squeeze(-1)
+        graph_pred = self.graph_classifier(h_graph)
+        
+        h_i = h.unsqueeze(2).expand(-1, -1, num_nodes, -1)
+        h_j = h.unsqueeze(1).expand(-1, num_nodes, -1, -1)
+        edge_input = torch.cat([h_i, h_j], dim=-1)
+        edge_preds = self.edge_predictor(edge_input)
         
         return {
-            'base_error_prob': base_probs,
-            'propagation_prob': propagation_probs,
-            'combined_prob': combined_probs,
-            'source_qubit': source_qubit
+            'node_predictions': node_preds.squeeze(-1),
+            'graph_prediction': graph_pred.squeeze(-1),
+            'edge_predictions': edge_preds.squeeze(-1),
+            'node_embeddings': h
         }
 
 
-def create_quantum_graph_from_telemetry(telemetry_data: Dict[int, np.ndarray],
-                                        num_qubits: int) -> QuantumGraph:
-    """Create a quantum graph from telemetry data"""
-    graph = QuantumGraph(num_qubits)
+class EntanglementGNN(nn.Module):
+    """Specialized GNN for entanglement stability analysis"""
     
-    for qubit_id, features in telemetry_data.items():
-        if 0 <= qubit_id < num_qubits:
-            graph.update_node_features(qubit_id, features)
-    
-    return graph
+    def __init__(self, config: GNNConfig):
+        super(EntanglementGNN, self).__init__()
+        self.config = config
+        
+        # Use simpler GCN layers instead of GAT to avoid shape issues
+        self.conv_layers = nn.ModuleList()
+        in_channels = config.node_features
+        
+        for i in range(config.num_layers):
+            out_channels = config.hidden_channels // (2 ** i) if i < config.num_layers - 1 else config.hidden_channels
+            conv = GraphConvolution(in_features=in_channels, out_features=out_channels, dropout=config.dropout)
+            self.conv_layers.append(conv)
+            in_channels = out_channels
+            
+        self.entanglement_stability = nn.Sequential(
+            nn.Linear(in_channels, in_channels),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(in_channels, 1),
+            nn.Sigmoid()
+        )
+        
+        self.fidelity_predictor = nn.Sequential(
+            nn.Linear(in_channels, in_channels),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(in_channels, 1)
+        )
+        
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> Dict[str, torch.Tensor]:
+        h = x
+        
+        for conv in self.conv_layers:
+            h = conv(h, adj)
+            h = F.elu(h)
+            
+        stability = self.entanglement_stability(h)
+        fidelity = self.fidelity_predictor(h)
+        
+        return {
+            'stability': stability.squeeze(-1),
+            'fidelity': fidelity.squeeze(-1),
+            'embeddings': h
+        }
 
 
-def simulate_error_cascade(graph: QuantumGraph, initial_error_qubit: int,
-                          threshold: float = 0.5) -> List[int]:
-    """Simulate error cascade through the quantum system"""
-    affected_qubits = [initial_error_qubit]
-    current_probs = graph.get_error_propagation_probability(initial_error_qubit)
+class GNNTrainer:
+    """Trainer for GNN models"""
     
-    # Iteratively find affected qubits
-    for _ in range(5):
-        new_affected = []
-        for qubit in range(graph.num_nodes):
-            if qubit not in affected_qubits and current_probs[qubit] > threshold:
-                new_affected.append(qubit)
+    def __init__(self, model: nn.Module, config: GNNConfig, device: torch.device = DEVICE):
+        self.model = model.to(device)
+        self.config = config
+        self.device = device
         
-        if not new_affected:
-            break
+        self.bce_loss = nn.BCELoss()
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=5)
         
-        affected_qubits.extend(new_affected)
+        self.history = {'train_loss': [], 'val_loss': [], 'node_acc': [], 'graph_acc': []}
         
-        # Update probabilities based on newly affected qubits
-        for qubit in new_affected:
-            prop_probs = graph.get_error_propagation_probability(qubit)
-            current_probs = np.maximum(current_probs, prop_probs * 0.8)
+    def prepare_data(self, graphs: List[Dict], val_split: float = 0.2) -> Tuple[List[Dict], List[Dict]]:
+        num_graphs = len(graphs)
+        num_val = int(num_graphs * val_split)
+        indices = np.random.permutation(num_graphs)
+        
+        train_graphs = [graphs[i] for i in indices[num_val:]]
+        val_graphs = [graphs[i] for i in indices[:num_val]]
+        
+        return train_graphs, val_graphs
     
-    return affected_qubits
+    def train_epoch(self, graphs: List[Dict]) -> float:
+        self.model.train()
+        total_loss = 0
+        
+        for graph in graphs:
+            x = torch.FloatTensor(graph['node_features']).unsqueeze(0).to(self.device)
+            adj = torch.FloatTensor(graph['adjacency']).unsqueeze(0).to(self.device)
+            
+            node_labels = torch.FloatTensor(graph.get('node_labels', np.zeros(x.shape[1]))).unsqueeze(0).to(self.device)
+            graph_label = torch.FloatTensor([graph.get('graph_label', 0)]).to(self.device)
+            
+            self.optimizer.zero_grad()
+            outputs = self.model(x, adj)
+            
+            loss = 0
+            
+            # Handle different output types for different models
+            if 'node_predictions' in outputs and outputs['node_predictions'].shape == node_labels.shape:
+                node_loss = self.bce_loss(outputs['node_predictions'], node_labels)
+                loss += node_loss
+                
+            if 'stability' in outputs:
+                # Entanglement GNN - use stability as node-level prediction
+                if node_labels.shape[-1] == outputs['stability'].shape[-1]:
+                    node_loss = self.bce_loss(outputs['stability'], node_labels)
+                    loss += node_loss
+                    
+            if graph_label is not None:
+                graph_pred = outputs.get('graph_prediction', outputs.get('stability', torch.zeros(1)).mean())
+                if len(graph_pred.shape) > 1:
+                    graph_pred = graph_pred.mean(dim=-1)
+                if len(graph_pred.shape) == 2:
+                    graph_pred = graph_pred.squeeze(0)
+                if graph_pred.dim() == 0:
+                    graph_pred = graph_pred.unsqueeze(0)
+                if graph_pred.shape == graph_label.shape:
+                    graph_loss = self.bce_loss(graph_pred, graph_label)
+                    loss += graph_loss
+                
+            if loss > 0:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                total_loss += loss.item()
+                
+        return total_loss / len(graphs) if graphs else 0
+    
+    def validate(self, graphs: List[Dict]) -> Tuple[float, float, float]:
+        self.model.eval()
+        node_correct = 0
+        node_total = 0
+        graph_correct = 0
+        graph_total = 0
+        
+        with torch.no_grad():
+            for graph in graphs:
+                x = torch.FloatTensor(graph['node_features']).unsqueeze(0).to(self.device)
+                adj = torch.FloatTensor(graph['adjacency']).unsqueeze(0).to(self.device)
+                
+                node_labels = graph.get('node_labels', np.zeros(x.shape[1]))
+                graph_label = graph.get('graph_label', 0)
+                
+                outputs = self.model(x, adj)
+                
+                # Handle different output types
+                if 'node_predictions' in outputs and len(node_labels) > 0:
+                    node_preds = outputs['node_predictions'].cpu().numpy()[0]
+                    node_correct += np.sum((node_preds > 0.5) == node_labels)
+                    node_total += len(node_labels)
+                elif 'stability' in outputs and len(node_labels) > 0:
+                    node_preds = outputs['stability'].cpu().numpy()[0]
+                    node_correct += np.sum((node_preds > 0.5) == node_labels)
+                    node_total += len(node_labels)
+                    
+                # Graph accuracy
+                if 'graph_prediction' in outputs:
+                    graph_pred = outputs['graph_prediction'].cpu().numpy()
+                    if isinstance(graph_pred, np.ndarray):
+                        graph_pred = graph_pred.item() if graph_pred.size == 1 else graph_pred.mean()
+                    graph_correct += (graph_pred > 0.5) == graph_label
+                    graph_total += 1
+                elif 'stability' in outputs:
+                    graph_pred = outputs['stability'].cpu().numpy().mean()
+                    graph_correct += (graph_pred > 0.5) == graph_label
+                    graph_total += 1
+                
+        node_acc = node_correct / node_total if node_total > 0 else 0
+        graph_acc = graph_correct / graph_total if graph_total > 0 else 0
+        
+        return 0, node_acc, graph_acc
+    
+    def train(self, train_graphs: List[Dict], val_graphs: List[Dict], num_epochs: Optional[int] = None) -> Dict:
+        num_epochs = num_epochs or self.config.num_epochs
+        
+        print(f"Training GNN on {self.device}")
+        print(f"Train graphs: {len(train_graphs)}, Val graphs: {len(val_graphs)}")
+        print("-" * 60)
+        
+        best_val_acc = 0
+        
+        for epoch in range(num_epochs):
+            train_loss = self.train_epoch(train_graphs)
+            _, node_acc, graph_acc = self.validate(val_graphs)
+            
+            self.history['train_loss'].append(train_loss)
+            self.history['node_acc'].append(node_acc)
+            self.history['graph_acc'].append(graph_acc)
+            
+            self.scheduler.step(-graph_acc)
+            
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(f"Epoch {epoch+1:3d}/{num_epochs}: Train Loss: {train_loss:.4f}, Node Acc: {node_acc:.4f}, Graph Acc: {graph_acc:.4f}")
+            
+            if graph_acc > best_val_acc:
+                best_val_acc = graph_acc
+                torch.save(self.model.state_dict(), 'best_gnn_model.pth')
+                
+        print("-" * 60)
+        print(f"Best graph accuracy: {best_val_acc:.4f}")
+        
+        return self.history
+
+
+def generate_quantum_graphs(num_graphs: int = 100, num_qubits: int = 10, seed: Optional[int] = None) -> List[Dict]:
+    """Generate synthetic quantum connectivity graphs for training"""
+    if seed is not None:
+        np.random.seed(seed)
+        
+    graphs = []
+    
+    for _ in range(num_graphs):
+        adj = np.zeros((num_qubits, num_qubits))
+        
+        for i in range(num_qubits - 1):
+            adj[i, i+1] = 1
+            adj[i+1, i] = 1
+            
+        num_long_range = np.random.randint(1, 4)
+        for _ in range(num_long_range):
+            i, j = np.random.choice(num_qubits, 2, replace=False)
+            adj[i, j] = 1
+            adj[j, i] = 1
+            
+        node_features = np.random.uniform(0, 1, (num_qubits, 8))
+        node_features[:, 0] = 0.5 + 0.5 * node_features[:, 1]
+        node_features[:, 4] = 1 - node_features[:, 3]
+        
+        error_prob = 1 - node_features[:, 2]
+        noise_factor = node_features[:, 7]
+        node_labels = (error_prob + noise_factor > 1.0).astype(float)
+        graph_label = float(np.mean(node_labels) > 0.3)
+        
+        graphs.append({
+            'node_features': node_features,
+            'adjacency': adj,
+            'node_labels': node_labels,
+            'graph_label': graph_label,
+            'num_qubits': num_qubits
+        })
+        
+    return graphs
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("GRAPH NEURAL NETWORKS FOR QUANTUM ERROR MODELING")
+    print("Graph Neural Networks for Quantum Error Propagation")
     print("=" * 60)
     
-    # Configuration
-    config = GraphConfig(num_nodes=5, node_features=17)
+    config = GNNConfig(num_nodes=10, node_features=8, edge_features=0, hidden_channels=64, num_layers=3, dropout=0.3, batch_size=16, num_epochs=30)
     
-    # Create quantum graph
-    print("\nInitializing quantum graph...")
-    graph = QuantumGraph(num_qubits=config.num_nodes)
+    print(f"\nGNN Configuration:")
+    print(f"  Num qubits: {config.num_nodes}")
+    print(f"  Node features: {config.node_features}")
+    print(f"  Hidden channels: {config.hidden_channels}")
+    print(f"  Num layers: {config.num_layers}")
+    print(f"  Device: {DEVICE}")
     
-    # Simulate realistic telemetry data
-    np.random.seed(42)
-    for i in range(config.num_nodes):
-        features = np.random.randn(17) * 0.1
-        # Add some degradation patterns
-        if i == 2:  # Qubit 2 has higher error rate
-            features[0] -= 0.5  # T1 degradation
-            features[1] -= 0.3  # T2 degradation
-            features[2] -= 0.4  # Gate fidelity
-        graph.update_node_features(i, features)
+    print("\nGenerating synthetic quantum graphs...")
+    graphs = generate_quantum_graphs(num_graphs=200, num_qubits=10, seed=42)
     
-    print(f"Graph created with {graph.num_nodes} qubits")
-    print(f"Connectivity: Nearest neighbor")
-    print(f"Edge count: {graph.edge_index.shape[1] if graph.edge_index.size > 0 else 0}")
+    print(f"Generated {len(graphs)} graphs")
+    print(f"Positive graph labels: {sum(g['graph_label'] for g in graphs)}")
     
-    # Initialize GNN
-    print("\nInitializing Graph Neural Network...")
-    gnns = [QuantumGNN(config) for _ in range(3)]  # Ensemble of 3 GNNs
+    trainer = GNNTrainer(QuantumGNN(config), config)
+    train_graphs, val_graphs = trainer.prepare_data(graphs, val_split=0.2)
     
-    # Predict error probabilities
-    print("\nPredicting error probabilities...")
-    all_predictions = []
-    for gnn in gnns:
-        preds = gnn.predict_error_probability(graph)
-        all_predictions.append(preds)
+    print(f"\nTrain: {len(train_graphs)} graphs, Val: {len(val_graphs)} graphs")
     
-    # Ensemble average
-    ensemble_preds = np.mean(all_predictions, axis=0)
-    
-    print("\nError Probability by Qubit:")
-    print("-" * 40)
-    for i, prob in enumerate(ensemble_preds):
-        risk_level = "LOW" if prob < 0.3 else "MEDIUM" if prob < 0.6 else "HIGH"
-        print(f"  Qubit {i}: {prob:.4f} [{risk_level}]")
-    
-    # Error propagation analysis
     print("\n" + "=" * 60)
-    print("ERROR PROPAGATION ANALYSIS")
+    print("Training Quantum GNN")
     print("=" * 60)
     
-    source_qubit = 2  # Assume qubit 2 has an error
-    gnn = gnns[0]
-    propagation_result = gnn.predict_error_propagation(graph, source_qubit)
+    history = trainer.train(train_graphs, val_graphs, num_epochs=30)
     
-    print(f"\nSource: Qubit {source_qubit}")
-    print("\nPropagation Probabilities:")
-    for i, (base, prop, combined) in enumerate(zip(
-        propagation_result['base_error_prob'],
-        propagation_result['propagation_prob'],
-        propagation_result['combined_prob']
-    )):
-        print(f"  Qubit {i}: Base={base:.4f}, Propagation={prop:.4f}, Combined={combined:.4f}")
-    
-    # Simulate error cascade
-    print("\nSimulating error cascade...")
-    cascade_qubits = simulate_error_cascade(graph, source_qubit, threshold=0.3)
-    print(f"Affected qubits in cascade: {cascade_qubits}")
-    print(f"Cascade size: {len(cascade_qubits)} / {config.num_nodes} qubits")
-    
-    # Topology optimization suggestion
     print("\n" + "=" * 60)
-    print("TOPOLOGY OPTIMIZATION SUGGESTIONS")
+    print("Testing Entanglement GNN")
     print("=" * 60)
     
-    high_risk_qubits = np.where(ensemble_preds > 0.5)[0]
-    if len(high_risk_qubits) > 0:
-        print(f"\nHigh-risk qubits detected: {high_risk_qubits.tolist()}")
-        print("Recommendations:")
-        for qubit in high_risk_qubits:
-            neighbors = np.where(graph.adjacency_matrix[qubit] > 0)[0]
-            print(f"  - Qubit {qubit}: Consider isolating from neighbors {neighbors.tolist()}")
-            print(f"    or migrating state to lower-connectivity qubit")
-    else:
-        print("\nNo high-risk qubits detected. System topology is stable.")
+    ent_config = GNNConfig(num_nodes=10, node_features=8, hidden_channels=32, num_layers=2, dropout=0.3)
+    ent_model = EntanglementGNN(ent_config)
+    ent_trainer = GNNTrainer(ent_model, ent_config)
+    
+    print("\nTraining Entanglement GNN...")
+    ent_history = ent_trainer.train(train_graphs, val_graphs, num_epochs=20)
     
     print("\n" + "=" * 60)
-    print("GNN ANALYSIS COMPLETE")
+    print("Demo Inference")
+    print("=" * 60)
+    
+    try:
+        trainer.model.load_state_dict(torch.load('best_gnn_model.pth', map_location=DEVICE, weights_only=True))
+        print("Loaded best GNN model")
+    except:
+        print("Using trained model directly")
+        
+    sample_graph = graphs[0]
+    x = torch.FloatTensor(sample_graph['node_features']).unsqueeze(0)
+    adj = torch.FloatTensor(sample_graph['adjacency']).unsqueeze(0)
+    
+    trainer.model.eval()
+    with torch.no_grad():
+        outputs = trainer.model(x, adj)
+        
+    print(f"\nSample graph predictions:")
+    print(f"  Graph stability: {outputs['graph_prediction'].item():.4f}")
+    print(f"  Node error probabilities: {outputs['node_predictions'].cpu().numpy()[0]}")
+    print(f"  Actual node labels: {sample_graph['node_labels']}")
+    
+    print("\n" + "=" * 60)
+    print("GNN Training Complete")
     print("=" * 60)
